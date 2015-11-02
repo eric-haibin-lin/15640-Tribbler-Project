@@ -2,12 +2,16 @@ package libstore
 
 import (
 	"errors"
-
+	"fmt"
+	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"net/rpc"
 )
 
 type libstore struct {
-	// TODO: implement this!
+	masterServerHostPort string
+	myHostPort           string
+	mode                 LeaseMode
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -35,7 +39,24 @@ type libstore struct {
 // need to create a brand new HTTP handler to serve the requests (the Libstore may
 // simply reuse the TribServer's HTTP handler since the two run in the same process).
 func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libstore, error) {
-	return nil, errors.New("not implemented")
+	defer fmt.Println("Leaving NewLibStore")
+	fmt.Println("Entered NewLibStore")
+
+	var a Libstore
+
+	libstore := libstore{}
+
+	libstore.masterServerHostPort = masterServerHostPort
+	libstore.myHostPort = myHostPort
+	libstore.mode = mode
+
+	a = &libstore
+
+	if mode != Never {
+		rpc.RegisterName("LeaseCallbacks", librpc.Wrap(a))
+	}
+
+	return a, nil
 }
 
 func (ls *libstore) Get(key string) (string, error) {
@@ -65,3 +86,97 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
 	return errors.New("not implemented")
 }
+
+/*package storagerpc
+
+// Status represents the status of a RPC's reply.
+type Status int
+
+const (
+	OK           Status = iota + 1 // The RPC was a success.
+	KeyNotFound                    // The specified key does not exist.
+	ItemNotFound                   // The specified item does not exist.
+	WrongServer                    // The specified key does not fall in the server's hash range.
+	ItemExists                     // The item already exists in the list.
+	NotReady                       // The storage servers are still getting ready.
+)
+
+// Lease constants.
+const (
+	QueryCacheSeconds = 10 // Time period used for tracking queries/determining whether to request leases.
+	QueryCacheThresh  = 3  // If QueryCacheThresh queries in last QueryCacheSeconds, then request a lease.
+	LeaseSeconds      = 10 // Number of seconds a lease should remain valid.
+	LeaseGuardSeconds = 2  // Additional seconds a server should wait before invalidating a lease.
+)
+
+// Lease stores information about a lease sent from the storage servers.
+type Lease struct {
+	Granted      bool
+	ValidSeconds int
+}
+
+type Node struct {
+	HostPort string // The host:port address of the storage server node.
+	NodeID   uint32 // The ID identifying this storage server node.
+}
+
+type RegisterArgs struct {
+	ServerInfo Node
+}
+
+type RegisterReply struct {
+	Status  Status
+	Servers []Node
+}
+
+type GetServersArgs struct {
+	// Intentionally left empty.
+}
+
+type GetServersReply struct {
+	Status  Status
+	Servers []Node
+}
+
+type GetArgs struct {
+	Key       string
+	WantLease bool
+	HostPort  string // The Libstore's callback host:port.
+}
+
+type GetReply struct {
+	Status Status
+	Value  string
+	Lease  Lease
+}
+
+type GetListReply struct {
+	Status Status
+	Value  []string
+	Lease  Lease
+}
+
+type PutArgs struct {
+	Key   string
+	Value string
+}
+
+type PutReply struct {
+	Status Status
+}
+
+type DeleteArgs struct {
+	Key string
+}
+
+type DeleteReply struct {
+	Status Status
+}
+
+type RevokeLeaseArgs struct {
+	Key string
+}
+
+type RevokeLeaseReply struct {
+	Status Status
+}*/
