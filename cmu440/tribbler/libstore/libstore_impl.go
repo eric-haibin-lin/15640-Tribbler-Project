@@ -68,21 +68,21 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 			fmt.Println("Oops! Couldn't register lease call backs")
 			return nil, err
 		}
-
-		srvr, err := rpc.DialHTTP("tcp", masterServerHostPort)
-		if err != nil {
-			fmt.Println("Oops! Returning because couldn't dial master host port")
-			return nil, errors.New("Couldn't Dial Master Host Port")
-		}
-
-		newlibstore.storageserver = srvr
 	}
+
+	srvr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+	if err != nil {
+		fmt.Println("Oops! Returning because couldn't dial master host port")
+		return nil, errors.New("Couldn't Dial Master Host Port")
+	}
+
+	newlibstore.storageserver = srvr
 
 	args := storagerpc.GetServersArgs{}
 
 	var reply storagerpc.GetServersReply
 
-	err := newlibstore.storageserver.Call("StorageServer.GetServers", args, &reply)
+	err = newlibstore.storageserver.Call("StorageServer.GetServers", args, &reply)
 	if err != nil {
 		return nil, err
 	}
