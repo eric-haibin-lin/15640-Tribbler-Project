@@ -1,17 +1,17 @@
 package tribserver
 
 import (
-//	"errors"
+	//	"errors"
+	"encoding/json"
 	"fmt"
+	"github.com/cmu440/tribbler/libstore"
+	"github.com/cmu440/tribbler/rpc/tribrpc"
+	"github.com/cmu440/tribbler/util"
 	"net"
 	"net/http"
 	"net/rpc"
-	"time"
 	"sort"
-	"encoding/json"
-	"github.com/cmu440/tribbler/util"
-	"github.com/cmu440/tribbler/libstore"
-	"github.com/cmu440/tribbler/rpc/tribrpc"
+	"time"
 )
 
 type tribServer struct {
@@ -65,7 +65,7 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tribrpc.SubscriptionReply) error {
 	userID := args.UserID
 	targetUserID := args.TargetUserID
-	//First check if user and target user exist 
+	//First check if user and target user exist
 	userIDKey := util.FormatUserKey(userID)
 	targetUserIDKey := util.FormatUserKey(targetUserID)
 	result, err := ts.lib.Get(userIDKey)
@@ -91,7 +91,7 @@ func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tri
 func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *tribrpc.SubscriptionReply) error {
 	userID := args.UserID
 	targetUserID := args.TargetUserID
-	//First check if user and target user exist 
+	//First check if user and target user exist
 	userIDKey := util.FormatUserKey(userID)
 	targetUserIDKey := util.FormatUserKey(targetUserID)
 	result, err := ts.lib.Get(userIDKey)
@@ -111,11 +111,11 @@ func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *
 		return nil
 	}
 	reply.Status = tribrpc.OK
-	return nil	
+	return nil
 }
 
 func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply *tribrpc.GetSubscriptionsReply) error {
-	userID := args.UserID 
+	userID := args.UserID
 	//First check if the user exists
 	userIDKey := util.FormatUserKey(userID)
 	result, err := ts.lib.Get(userIDKey)
@@ -123,7 +123,7 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 		reply.Status = tribrpc.NoSuchUser
 		return nil
 	}
-	userSubKey := util.FormatSubListKey(userID)	
+	userSubKey := util.FormatSubListKey(userID)
 	list, err := ts.lib.GetList(userSubKey)
 	if err != nil {
 		return err
@@ -147,16 +147,16 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	}
 	tribListKey := util.FormatTribListKey(userID)
 	postKey := util.FormatPostKey(userID, postTime.UnixNano())
-	tribble := tribrpc.Tribble {
-		UserID : userID,
-		Posted : postTime,
-		Contents: contents }
+	tribble := tribrpc.Tribble{
+		UserID:   userID,
+		Posted:   postTime,
+		Contents: contents}
 	marshaledTribble, err := json.Marshal(tribble)
 	if err != nil {
 		fmt.Println("PostTribble error:", err)
 		return err
-	} 
-	//update tribble list and user's post list on storage server 
+	}
+	//update tribble list and user's post list on storage server
 	err = ts.lib.Put(postKey, string(marshaledTribble))
 	if err != nil {
 		fmt.Println("PostTribble error:", err)
@@ -174,7 +174,7 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 
 func (ts *tribServer) DeleteTribble(args *tribrpc.DeleteTribbleArgs, reply *tribrpc.DeleteTribbleReply) error {
 	postKey := args.PostKey
-	userID := args.UserID 
+	userID := args.UserID
 	//First check if the user exists
 	userIDKey := util.FormatUserKey(userID)
 	result, err := ts.lib.Get(userIDKey)
@@ -187,7 +187,7 @@ func (ts *tribServer) DeleteTribble(args *tribrpc.DeleteTribbleArgs, reply *trib
 		reply.Status = tribrpc.NoSuchPost
 		return nil
 	}
-	//update tribble list and user's post list on storage server 
+	//update tribble list and user's post list on storage server
 	tribListKey := util.FormatTribListKey(userID)
 	err = ts.lib.RemoveFromList(tribListKey, postKey)
 	if err != nil {
@@ -213,11 +213,11 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 	//Then get the tribble list of this user
 	tribListKey := util.FormatTribListKey(userID)
 	list, _ := ts.lib.GetList(tribListKey)
-	//Next get all posts, up to 100 
+	//Next get all posts, up to 100
 	tribbles := make([]tribrpc.Tribble, 0)
 	count := 0
-	for i := len(list)-1; i >= 0; i-- {
-   		postKey := list[i]
+	for i := len(list) - 1; i >= 0; i-- {
+		postKey := list[i]
 		marshaledTribble, err := ts.lib.Get(postKey)
 		var tribble tribrpc.Tribble
 		json.Unmarshal([]byte(marshaledTribble), &tribble)
@@ -244,18 +244,18 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 		reply.Status = tribrpc.NoSuchUser
 		return nil
 	}
-	//Then get the subscription list of this user 
-	subListKey := util.FormatSubListKey(userID)	
+	//Then get the subscription list of this user
+	subListKey := util.FormatSubListKey(userID)
 	subList, _ := ts.lib.GetList(subListKey)
 	tribbles := make([]tribrpc.Tribble, 0)
 	for _, targetUserID := range subList {
 		//Then get the tribble list of this target user
 		tribListKey := util.FormatTribListKey(targetUserID)
 		list, _ := ts.lib.GetList(tribListKey)
-		//Next get all posts, up to 100 
+		//Next get all posts, up to 100
 		count := 0
-		for i := len(list)-1; i >= 0; i-- {
-	   		postKey := list[i]
+		for i := len(list) - 1; i >= 0; i-- {
+			postKey := list[i]
 			marshaledTribble, err := ts.lib.Get(postKey)
 			if err == nil {
 				var tribble tribrpc.Tribble
@@ -275,14 +275,16 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	if length > 100 {
 		length = 100
 	}
-	fmt.Println("GetTribblesBySubscription returning", length, "results" )
+	fmt.Println("GetTribblesBySubscription returning", length, "results")
 	reply.Status = tribrpc.OK
 	reply.Tribbles = tribbles[:length]
 	return nil
 }
 
 type ByTime []tribrpc.Tribble
-func (a ByTime) Len() int           { return len(a) }
-func (a ByTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+
+func (a ByTime) Len() int      { return len(a) }
+func (a ByTime) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
 //Actually returns greater than since we're getting the most recent ones
 func (a ByTime) Less(i, j int) bool { return a[i].Posted.UnixNano() > a[j].Posted.UnixNano() }
