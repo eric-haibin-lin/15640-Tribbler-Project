@@ -1,6 +1,7 @@
 package storageserver
 
 import (
+	"errors"
 	"fmt"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"net"
@@ -17,6 +18,8 @@ type storageServer struct {
 	listMap              map[string][]string
 	ackedSlaves          int
 	serverList           []storagerpc.Node
+	ackedSlavesMap       map[storagerpc.Node]bool
+	leaseMap		map[string][]string
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -40,6 +43,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	server.nodeID = nodeID
 	server.tribbleMap = make(map[string]string)
 	server.listMap = make(map[string][]string)
+	server.ackedSlavesMap = make(map[storagerpc.Node]bool)
 	//server.serverList = make([]storagerpc.Node, 32)
 
 	a = &server
@@ -78,6 +82,24 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		/*fmt.Println("I am just a lowly Slave.")
 		fmt.Println("Number of nodes in the client is ", numNodes, " and the port is ", port, " and the nodeID is ", nodeID, " and the masterserverhostport is ", masterServerHostPort)*/
 		/* Now try connecting to the ring by calling the RegisterServer RPC */
+
+		srvr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+		if err != nil {
+			fmt.Println("Oops! Returning because couldn't dial master host port")
+			return nil, errors.New("Couldn't Dial Master Host Port")
+		}
+
+		args := storagerpc.RegisterArgs{}
+		args.ServerInfo.HostPort = fmt.Sprintf("localhost:%d", port)
+		args.ServerInfo.NodeID = nodeID
+
+		var reply storagerpc.RegisterReply
+
+		err = srvr.Call("StorageServer.RegisterServer", args, &reply)
+		if err != nil {
+			return nil, err
+		}
+
 	}
 
 	/* For master: Now wait until all other servers have joined the ring */
@@ -91,22 +113,31 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
 	defer fmt.Println("Leaving RegisterServer")
 	fmt.Println("RegisterServer invoked!")
-	ss.serverList = append(ss.serverList, args.ServerInfo)
-	ss.ackedSlaves += 1
 	/*fmt.Println("numNodes inside RegisterServer is ", ss.numNodes)
 	fmt.Println("After adding slave to list of servers, ackedSlaves is ", ss.ackedSlaves)
 	fmt.Println("HostPort of this slave server is ", args.ServerInfo.HostPort, " and the nodeID is ", args.ServerInfo.NodeID)*/
 
+	if _, ok := ss.ackedSlavesMap[args.ServerInfo]; ok {
+		if ss.ackedSlaves == ss.numNodes {
+			reply.Status = storagerpc.OK
+			//TODO: Sort this list!
+			reply.Servers = ss.serverList
+			return nil
+		}
+		reply.Status = storagerpc.NotReady
+		return nil
+	}
+
+	ss.serverList = append(ss.serverList, args.ServerInfo)
+	ss.ackedSlaves += 1
+	ss.ackedSlavesMap[args.ServerInfo] = true
+
 	if ss.ackedSlaves == ss.numNodes {
-		//fmt.Println("Inside OK")
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.serverList
-		//fmt.Println("serverlist is ", ss.serverList)
 	} else {
-		//fmt.Println("Inside NOTOK")
 		reply.Status = storagerpc.NotReady
 	}
-	ss.numNodes = 3
 	return nil
 }
 
@@ -126,8 +157,8 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
-	//fmt.Println("Get invoked!")
-	//fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
+	fmt.Println("Get invoked!")
+	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
 	val, ok := ss.tribbleMap[args.Key]
 
@@ -138,6 +169,9 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 
 	reply.Status = storagerpc.OK
 	reply.Value = val
+
+	if GetArgs.WantLease == true {
+		
 	return nil
 }
 
@@ -171,7 +205,8 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	//fmt.Println("Put invoked!")
+	fmt.Println("Put invoked!")
+	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 	/* TODO: If key exists, revoke leases! */
 
 	ss.tribbleMap[args.Key] = args.Value
