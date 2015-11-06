@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"sync"
+	"time"
 )
 
 type storageServer struct {
@@ -14,12 +16,19 @@ type storageServer struct {
 	nodeID               uint32
 	port                 int
 	masterServerHostPort string
-	tribbleMap           map[string]string
-	listMap              map[string][]string
+	tribbleMap           map[string]string   //need lock
+	listMap              map[string][]string //need lock
 	ackedSlaves          int
 	serverList           []storagerpc.Node
-	ackedSlavesMap       map[storagerpc.Node]bool
-	leaseMap		map[string][]string
+	ackedSlavesMap       map[storagerpc.Node]bool //need lock
+	//need lock
+	leaseMap      map[string][]string //For keeping a track of which key is cached by which libstore
+	revokeKeysMap map[string]bool     //need lock
+	putBlockChans map[string]chan int //need lock
+	pendingPuts   map[string]bool     //need lock
+
+	putLock     *sync.Mutex
+	putLocksMap map[string]*sync.Mutex
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -30,6 +39,7 @@ type storageServer struct {
 //
 // This function should return only once all storage servers have joined the ring,
 // and should return a non-nil error if the storage server could not be started.
+
 func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID uint32) (StorageServer, error) {
 	defer fmt.Println("Leaving NewStorageServer")
 	fmt.Println("Entered NewStorageServer")
@@ -44,7 +54,14 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	server.tribbleMap = make(map[string]string)
 	server.listMap = make(map[string][]string)
 	server.ackedSlavesMap = make(map[storagerpc.Node]bool)
+	server.leaseMap = make(map[string][]string)
+	server.revokeKeysMap = make(map[string]bool)
+	server.putBlockChans = make(map[string]chan int)
+	server.pendingPuts = make(map[string]bool)
+	server.putLocksMap = make(map[string]*sync.Mutex)
 	//server.serverList = make([]storagerpc.Node, 32)
+
+	server.putLock = &sync.Mutex{}
 
 	a = &server
 
@@ -99,7 +116,6 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		if err != nil {
 			return nil, err
 		}
-
 	}
 
 	/* For master: Now wait until all other servers have joined the ring */
@@ -157,6 +173,7 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
+	defer fmt.Println("Leaving Get")
 	fmt.Println("Get invoked!")
 	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
@@ -170,53 +187,229 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	reply.Status = storagerpc.OK
 	reply.Value = val
 
-	if GetArgs.WantLease == true {
-		
+	//If revoking in process, ok will be true, and don't give lease!
+	_, ok = ss.revokeKeysMap[args.Key]
+
+	if args.WantLease == true && !ok {
+		if _, ok := ss.leaseMap[args.Key]; !ok {
+			var templist []string
+			templist = append(templist, args.HostPort)
+			ss.leaseMap[args.Key] = templist
+		} else {
+			ss.leaseMap[args.Key] = append(ss.leaseMap[args.Key], args.HostPort)
+		}
+		reply.Status = storagerpc.OK
+		reply.Lease.Granted = true
+		reply.Lease.ValidSeconds = storagerpc.LeaseSeconds
+		go handleLeaseExpire(ss, storagerpc.LeaseSeconds, args.Key, args.HostPort)
+	} else {
+		reply.Lease.Granted = false
+	}
+
 	return nil
 }
 
+func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
+	defer fmt.Println("Leaving GetList")
+	fmt.Println("GetList invoked!")
+	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
+
+	val, ok := ss.listMap[args.Key]
+
+	if !ok {
+		reply.Status = storagerpc.KeyNotFound
+		return nil
+	}
+	reply.Status = storagerpc.OK
+	reply.Value = val
+
+	if args.WantLease == true {
+		if _, ok := ss.leaseMap[args.Key]; !ok {
+			var templist []string
+			templist = append(templist, args.HostPort)
+			ss.leaseMap[args.Key] = templist
+		} else {
+			ss.leaseMap[args.Key] = append(ss.leaseMap[args.Key], args.HostPort)
+		}
+		reply.Status = storagerpc.OK
+		reply.Lease.Granted = true
+		reply.Lease.ValidSeconds = storagerpc.LeaseSeconds
+		go handleLeaseExpire(ss, storagerpc.LeaseSeconds, args.Key, args.HostPort)
+	} else {
+		reply.Lease.Granted = false
+	}
+	return nil
+}
+
+func revoke(ss *storageServer, key string, libstore *rpc.Client, hostport string) {
+
+	args2 := storagerpc.RevokeLeaseArgs{}
+	args2.Key = key
+
+	var reply storagerpc.RevokeLeaseReply
+
+	err := libstore.Call("LeaseCallbacks.RevokeLease", args2, &reply)
+	if err != nil {
+		fmt.Println("RevokeLeaseFailed")
+		return
+	}
+
+	//now remove entry from leaseMap
+	i := 0
+	for _, val := range ss.leaseMap[key] {
+		if val == hostport {
+			ss.leaseMap[key] = append((ss.leaseMap[key])[:i], (ss.leaseMap[key])[i+1:]...)
+
+			_, ok := ss.pendingPuts[key]
+			// if last one and pending put, write to channel
+			if len(ss.leaseMap[key]) == 0 && ok {
+				ss.putBlockChans[key] <- 1
+			}
+			return
+		}
+		i = i + 1
+	}
+
+}
+
 func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.DeleteReply) error {
-	//fmt.Println("Delete invoked!")
+	defer fmt.Println("Leaving Delete")
+	fmt.Println("Delete invoked!")
+	fmt.Println("Key is ", args.Key)
 
-	//fmt.Println("Key is ", args.Key)
+	ss.putLock.Lock() // lock map of locks
+	_, ok := ss.putLocksMap[args.Key]
+	if ok {
+		ss.putLocksMap[args.Key].Lock()
+	} else {
+		ss.putLocksMap[args.Key] = &sync.Mutex{}
+		ss.putLocksMap[args.Key].Lock()
+	}
+	ss.putLock.Unlock()
 
-	_, ok := ss.tribbleMap[args.Key]
+	_, ok = ss.tribbleMap[args.Key]
 
 	if !ok {
 		reply.Status = storagerpc.KeyNotFound
 		return nil
 	}
 
+	// now we know that the key is present in the map
+	// now check if we need to revoke any leases
+
+	if list, ok := ss.leaseMap[args.Key]; ok {
+		ss.pendingPuts[args.Key] = true
+		fmt.Println("In Put, will be revoking leases for key ", args.Key)
+		ss.revokeKeysMap[args.Key] = true //for get
+
+		channel := make(chan int, 100)
+		ss.putBlockChans[args.Key] = channel
+
+		for _, node := range list {
+			fmt.Println("Trying to revoke lease on ", node)
+			libstore, err := rpc.DialHTTP("tcp", node)
+
+			if err != nil {
+				fmt.Println("Oops! Returning because couldn't dial libstore")
+				return errors.New("Couldn't Dial Master Host Port")
+			}
+
+			fmt.Println("Before RevokeLease")
+
+			go revoke(ss, args.Key, libstore, node)
+			/*err = libstore.Call("LeaseCallbacks.RevokeLease", args2, &reply)
+			if err != nil {
+				fmt.Println("RevokeLeaseFailed")
+				return err
+			}*/
+			fmt.Println("After RevokeLease")
+		}
+
+		fmt.Println("Waiting for info that all revokes are done for key ", args.Key)
+		_ = <-ss.putBlockChans[args.Key]
+		fmt.Println("Got flag that all revokes are done for key ", args.Key)
+
+		delete(ss.pendingPuts, args.Key)
+		delete(ss.revokeKeysMap, args.Key)
+		delete(ss.leaseMap, args.Key) //should be cleared also by handleLeaseTimeouts
+		delete(ss.putBlockChans, args.Key)
+	}
+
 	delete(ss.tribbleMap, args.Key)
 	reply.Status = storagerpc.OK
-
-	return nil
-}
-
-func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
-	//fmt.Println("GetList invoked!")
-
-	//fmt.Println("Key is ", args.Key)0
-
-	reply.Status = storagerpc.OK
-	reply.Value = ss.listMap[args.Key]
+	ss.putLocksMap[args.Key].Unlock()
 
 	return nil
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
+	defer fmt.Println("Leaving Put")
 	fmt.Println("Put invoked!")
+
+	ss.putLock.Lock() // lock map of locks
+	_, ok := ss.putLocksMap[args.Key]
+	if ok {
+		ss.putLocksMap[args.Key].Lock()
+	} else {
+		ss.putLocksMap[args.Key] = &sync.Mutex{}
+		ss.putLocksMap[args.Key].Lock()
+	}
+	ss.putLock.Unlock()
+
 	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 	/* TODO: If key exists, revoke leases! */
 
+	//Key exists in lease map!
+
+	if list, ok := ss.leaseMap[args.Key]; ok {
+		ss.pendingPuts[args.Key] = true
+		fmt.Println("In Put, will be revoking leases for key ", args.Key)
+		ss.revokeKeysMap[args.Key] = true //for get
+
+		channel := make(chan int, 100)
+		ss.putBlockChans[args.Key] = channel
+
+		for _, node := range list {
+			fmt.Println("Trying to revoke lease on ", node)
+			libstore, err := rpc.DialHTTP("tcp", node)
+
+			if err != nil {
+				fmt.Println("Oops! Returning because couldn't dial libstore")
+				return errors.New("Couldn't Dial Master Host Port")
+			}
+
+			fmt.Println("Before RevokeLease")
+
+			go revoke(ss, args.Key, libstore, node)
+			/*err = libstore.Call("LeaseCallbacks.RevokeLease", args2, &reply)
+			if err != nil {
+				fmt.Println("RevokeLeaseFailed")
+				return err
+			}*/
+			fmt.Println("After RevokeLease")
+		}
+
+		fmt.Println("Waiting for info that all revokes are done for key ", args.Key)
+		_ = <-ss.putBlockChans[args.Key]
+		fmt.Println("Got flag that all revokes are done for key ", args.Key)
+
+		delete(ss.pendingPuts, args.Key)
+		delete(ss.revokeKeysMap, args.Key)
+		delete(ss.leaseMap, args.Key) //should be cleared also by handleLeaseTimeouts
+		delete(ss.putBlockChans, args.Key)
+	}
+
 	ss.tribbleMap[args.Key] = args.Value
 	reply.Status = storagerpc.OK
+	ss.putLocksMap[args.Key].Unlock()
+
 	return nil
 }
 
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	/*fmt.Println("AppendToList invoked!")
-	fmt.Println("Key is ", args.Key, " and Value is ", args.Value)*/
+	defer fmt.Println("Leaving AppendToList")
+	fmt.Println("AppendToList invoked!")
+	fmt.Println("Key is ", args.Key, " and Value is ", args.Value)
 	reply.Status = storagerpc.OK
 
 	var templist []string
@@ -224,11 +417,9 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	_, ok := ss.listMap[args.Key]
 
 	if !ok {
-		//fmt.Println("Inside not ok")
 		templist = append(templist, args.Value)
 		ss.listMap[args.Key] = templist
 	} else {
-		//fmt.Println("Inside ok")
 		for _, val := range ss.listMap[args.Key] {
 			if val == args.Value {
 				reply.Status = storagerpc.ItemExists
@@ -244,7 +435,9 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	//fmt.Println("RemoveFromList invoked!")
+	defer fmt.Println("Leaving RemoveFromList")
+	fmt.Println("RemoveFromList invoked!")
+	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 
 	i := 0
 	for _, val := range ss.listMap[args.Key] {
@@ -253,9 +446,37 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 			reply.Status = storagerpc.OK
 			return nil
 		}
+		i = i + 1
 	}
 	reply.Status = storagerpc.ItemNotFound
 	return nil
+}
+
+func handleLeaseExpire(ss *storageServer, seconds int, key string, hostport string) {
+	defer fmt.Println("Leaving handleLeaseExpire for key ", key, " and hostport ", hostport)
+	fmt.Println("HandleLeaseExpire invoked!")
+	fmt.Println("Seconds is ", seconds, ", key is ", key, " and hostport is ", hostport)
+	time.Sleep((storagerpc.LeaseSeconds + storagerpc.LeaseGuardSeconds) * time.Second)
+
+	//TODO: Lock the maps before this!
+	i := 0
+	for _, val := range ss.leaseMap[key] {
+		if val == hostport {
+			ss.leaseMap[key] = append((ss.leaseMap[key])[:i], (ss.leaseMap[key])[i+1:]...)
+
+			//write to channel if last one and pending put, otherwise simply remove entry from map
+			_, ok := ss.pendingPuts[key]
+			if len(ss.leaseMap[key]) == 0 {
+				if ok {
+					ss.putBlockChans[key] <- 1
+				} else {
+					delete(ss.leaseMap, key)
+				}
+			}
+			return
+		}
+		i = i + 1
+	}
 }
 
 /*
@@ -357,12 +578,3 @@ type RevokeLeaseReply struct {
 	Status Status
 }
 */
-
-/*func (tc *tribClient) CreateUser(userID string) (tribrpc.Status, error) {
-	args := &tribrpc.CreateUserArgs{UserID: userID}
-	var reply tribrpc.CreateUserReply
-	if err := tc.client.Call("TribServer.CreateUser", args, &reply); err != nil {
-		return 0, err
-	}
-	return reply.Status, nil
-}*/
