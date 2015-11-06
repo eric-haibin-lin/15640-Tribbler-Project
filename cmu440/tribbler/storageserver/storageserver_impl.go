@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"hash/fnv"
 	"net"
 	"net/http"
 	"net/rpc"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +36,13 @@ type storageServer struct {
 
 	appendLock     *sync.Mutex
 	appendLocksMap map[string]*sync.Mutex
+
+	allSlavesAcked chan int
+
+	minhash uint32
+	maxhash uint32
+
+	first int
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -47,6 +57,7 @@ type storageServer struct {
 func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID uint32) (StorageServer, error) {
 	defer fmt.Println("Leaving NewStorageServer")
 	fmt.Println("Entered NewStorageServer")
+
 	var a StorageServer
 
 	server := storageServer{}
@@ -64,6 +75,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	server.pendingPuts = make(map[string]bool)
 	server.putLocksMap = make(map[string]*sync.Mutex)
 	server.appendLocksMap = make(map[string]*sync.Mutex)
+	server.allSlavesAcked = make(chan int, 100)
 	//server.serverList = make([]storagerpc.Node, 32)
 
 	server.putLock = &sync.Mutex{}
@@ -72,8 +84,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	a = &server
 
 	if len(masterServerHostPort) == 0 {
-		/*fmt.Println("This is the Master Speaking!")
-		fmt.Println("Number of nodes in the master is ", numNodes, " and the port is ", port, " and the nodeID is ", nodeID)*/
+		fmt.Println("This is the master speaking, with numNode = ", numNodes)
 		/* Now register for RPCs */
 		server.ackedSlaves = 1
 		self := storagerpc.Node{fmt.Sprintf("localhost:%d", port), nodeID}
@@ -94,22 +105,58 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		go http.Serve(listener, nil)
 
 		/* Now wait until all nodes have joined */
-		/*fmt.Println("Before spining, ackedSlaves=", server.ackedSlaves)
-		fmt.Println("Sleeping for some time")*/
-		//fmt.Println("Before sleeping, acked Slaves is ", server.ackedSlaves)
-		//time.Sleep(5000 * time.Millisecond)
-		//for server.ackedSlaves != numNodes {
-		//fmt.Println("Spining :( with ackedSlaves = ", server.ackedSlaves)
-		//}
+		fmt.Println("Master waiting for all children")
+		if numNodes != 1 {
+			_ = <-server.allSlavesAcked
+		}
+		fmt.Println("Master heard from all children")
+		sort.Sort(ServerSlice(server.serverList))
+
+		i := 0
+
+		for server.serverList[i].NodeID != nodeID {
+			i = i + 1
+		}
+		if i == 0 {
+			server.minhash = server.serverList[len(server.serverList)-1].NodeID
+			server.maxhash = nodeID
+			server.first = 1
+		} else {
+			server.maxhash = nodeID
+			server.minhash = server.serverList[i-1].NodeID
+			server.first = 0
+		}
+
 	} else {
-		/*fmt.Println("I am just a lowly Slave.")
-		fmt.Println("Number of nodes in the client is ", numNodes, " and the port is ", port, " and the nodeID is ", nodeID, " and the masterserverhostport is ", masterServerHostPort)*/
+		fmt.Println("I am just a lowly Slave.")
+		fmt.Println("Number of nodes in the client is ", numNodes, " and the port is ", port, " and the nodeID is ", nodeID, " and the masterserverhostport is ", masterServerHostPort)
 		/* Now try connecting to the ring by calling the RegisterServer RPC */
 
-		srvr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+		listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
 		if err != nil {
-			fmt.Println("Oops! Returning because couldn't dial master host port")
-			return nil, errors.New("Couldn't Dial Master Host Port")
+			fmt.Println("Returning from NewStorageServer because couldn't listen on given port")
+			return nil, err
+		}
+
+		err = rpc.RegisterName("StorageServer", storagerpc.Wrap(a))
+		if err != nil {
+			fmt.Println("Returning from NewStorageServer because couldn't register rpc")
+			return nil, err
+		}
+
+		rpc.HandleHTTP()
+		go http.Serve(listener, nil)
+
+		srvr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+		for {
+			if err != nil {
+				fmt.Println("Oops! Returning because couldn't dial master host port. Let's try after 1 sec")
+				//return nil, errors.New("Couldn't Dial Master Host Port")
+			} else {
+				break
+			}
+			time.Sleep(1 * time.Second)
+			srvr, err = rpc.DialHTTP("tcp", masterServerHostPort)
 		}
 
 		args := storagerpc.RegisterArgs{}
@@ -118,10 +165,34 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 		var reply storagerpc.RegisterReply
 
-		err = srvr.Call("StorageServer.RegisterServer", args, &reply)
-		if err != nil {
-			return nil, err
+		for {
+			err := srvr.Call("StorageServer.RegisterServer", args, &reply)
+			if err != nil {
+				fmt.Println("Returning from NewStorageServer because Call returned : ", err)
+				return nil, err
+			}
+			if reply.Status == storagerpc.OK {
+				server.serverList = reply.Servers
+				break
+			}
+			time.Sleep(1 * time.Second)
 		}
+		sort.Sort(ServerSlice(server.serverList))
+		i := 0
+
+		for server.serverList[i].NodeID != nodeID {
+			i = i + 1
+		}
+		if i == 0 {
+			server.minhash = server.serverList[len(server.serverList)-1].NodeID
+			server.maxhash = nodeID
+			server.first = 1
+		} else {
+			server.maxhash = nodeID
+			server.minhash = server.serverList[i-1].NodeID
+			server.first = 0
+		}
+
 	}
 
 	/* For master: Now wait until all other servers have joined the ring */
@@ -134,7 +205,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
 	defer fmt.Println("Leaving RegisterServer")
-	fmt.Println("RegisterServer invoked!")
+	fmt.Println("RegisterServer invoked! By: ", args.ServerInfo.HostPort)
 	/*fmt.Println("numNodes inside RegisterServer is ", ss.numNodes)
 	fmt.Println("After adding slave to list of servers, ackedSlaves is ", ss.ackedSlaves)
 	fmt.Println("HostPort of this slave server is ", args.ServerInfo.HostPort, " and the nodeID is ", args.ServerInfo.NodeID)*/
@@ -144,6 +215,7 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 			reply.Status = storagerpc.OK
 			//TODO: Sort this list!
 			reply.Servers = ss.serverList
+			ss.allSlavesAcked <- 1
 			return nil
 		}
 		reply.Status = storagerpc.NotReady
@@ -155,8 +227,10 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 	ss.ackedSlavesMap[args.ServerInfo] = true
 
 	if ss.ackedSlaves == ss.numNodes {
+		//TODO: Sort this list!
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.serverList
+		ss.allSlavesAcked <- 1
 	} else {
 		reply.Status = storagerpc.NotReady
 	}
@@ -171,6 +245,7 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.serverList
 		fmt.Println("Returning OK")
+		fmt.Println("The list of servers is ", reply.Servers)
 		return nil
 	}
 	reply.Status = storagerpc.NotReady
@@ -181,6 +256,24 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
 	defer fmt.Println("Leaving Get")
 	fmt.Println("Get invoked!")
+	fmt.Println("Key is ", args.Key)
+	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			fmt.Println("Returning because hash doesn't match")
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			fmt.Println("Returning because hash doesn't match")
+			return nil
+		}
+	}
+
 	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
 	val, ok := ss.tribbleMap[args.Key]
@@ -218,6 +311,19 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
 	defer fmt.Println("Leaving GetList")
 	fmt.Println("GetList invoked!")
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	}
 	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
 	val, ok := ss.listMap[args.Key]
@@ -284,6 +390,19 @@ func revoke(ss *storageServer, key string, libstore *rpc.Client, hostport string
 func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.DeleteReply) error {
 	defer fmt.Println("Leaving Delete")
 	fmt.Println("Delete invoked!")
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	}
 	fmt.Println("Key is ", args.Key)
 
 	ss.putLock.Lock() // lock map of locks
@@ -308,7 +427,7 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 
 	if list, ok := ss.leaseMap[args.Key]; ok {
 		ss.pendingPuts[args.Key] = true
-		fmt.Println("In Put, will be revoking leases for key ", args.Key)
+		fmt.Println("In Delete, will be revoking leases for key ", args.Key)
 		ss.revokeKeysMap[args.Key] = true //for get
 
 		channel := make(chan int, 100)
@@ -350,6 +469,23 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	defer fmt.Println("Leaving Put")
 	fmt.Println("Put invoked!")
+	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
+	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			fmt.Println("Returning because hashes don't match")
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			fmt.Println("Returning because hashes don't match")
+			return nil
+		}
+	}
 
 	ss.putLock.Lock() // lock map of locks
 	_, ok := ss.putLocksMap[args.Key]
@@ -410,6 +546,19 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	defer fmt.Println("Leaving AppendToList")
 	fmt.Println("AppendToList invoked!")
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	}
 	fmt.Println("Key is ", args.Key, " and Value is ", args.Value)
 
 	ss.appendLock.Lock() // lock map of locks
@@ -485,6 +634,19 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	defer fmt.Println("Leaving RemoveFromList")
 	fmt.Println("RemoveFromList invoked!")
+
+	hash := StoreHash(args.Key)
+	if ss.first == 1 {
+		if !(hash > ss.minhash || hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	} else {
+		if !(hash > ss.minhash && hash <= ss.maxhash) {
+			reply.Status = storagerpc.WrongServer
+			return nil
+		}
+	}
 	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 
 	ss.appendLock.Lock() // lock map of locks
@@ -551,6 +713,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 func handleLeaseExpire(ss *storageServer, seconds int, key string, hostport string) {
 	defer fmt.Println("Leaving handleLeaseExpire for key ", key, " and hostport ", hostport)
 	fmt.Println("HandleLeaseExpire invoked!")
+
 	fmt.Println("Seconds is ", seconds, ", key is ", key, " and hostport is ", hostport)
 	time.Sleep((storagerpc.LeaseSeconds + storagerpc.LeaseGuardSeconds) * time.Second)
 
@@ -573,6 +736,27 @@ func handleLeaseExpire(ss *storageServer, seconds int, key string, hostport stri
 		}
 		i = i + 1
 	}
+}
+
+type ServerSlice []storagerpc.Node
+
+func (slice ServerSlice) Len() int {
+	return len(slice)
+}
+
+func (slice ServerSlice) Less(i, j int) bool {
+	return slice[i].NodeID < slice[j].NodeID
+}
+
+func (slice ServerSlice) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
+}
+
+func StoreHash(key string) uint32 {
+	prefix := strings.Split(key, ":")[0]
+	hasher := fnv.New32()
+	hasher.Write([]byte(prefix))
+	return hasher.Sum32()
 }
 
 /*
