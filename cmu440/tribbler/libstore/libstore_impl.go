@@ -6,15 +6,18 @@ import (
 	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	//"net"
+	"time"
 	//"net/http"
 	"net/rpc"
+	"sort"
 )
 
 type libstore struct {
 	masterServerHostPort string
 	myHostPort           string
 	mode                 LeaseMode
-	storageserver        *rpc.Client
+	listServers          []storagerpc.Node
+	listDialers          []*rpc.Client
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -58,11 +61,6 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	b = &newlibstore
 
 	if mode != Never {
-		/*listener, err := net.Listen("tcp", myHostPort)
-		if err != nil {
-			return nil, err
-		}*/
-
 		err := rpc.RegisterName("LeaseCallbacks", librpc.Wrap(b))
 		if err != nil {
 			fmt.Println("Oops! Couldn't register lease call backs")
@@ -76,24 +74,52 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		return nil, errors.New("Couldn't Dial Master Host Port")
 	}
 
-	newlibstore.storageserver = srvr
+	//newlibstore.storageserver = srvr
 
 	args := storagerpc.GetServersArgs{}
 
 	var reply storagerpc.GetServersReply
 
-	err = newlibstore.storageserver.Call("StorageServer.GetServers", args, &reply)
-	if err != nil {
-		return nil, err
+	for {
+		err = srvr.Call("StorageServer.GetServers", args, &reply)
+		if err != nil {
+			return nil, err
+		}
+		if reply.Status != storagerpc.OK {
+			time.Sleep(1)
+		} else {
+			break
+		}
 	}
 
-	fmt.Println("Status of GetServers ", reply.Status, ", and the list of servers is ", reply.Servers)
+	sort.Sort(ServerSlice(reply.Servers))
+
+	for _, node := range reply.Servers {
+		srvr, _ := rpc.DialHTTP("tcp", node.HostPort)
+		newlibstore.listDialers = append(newlibstore.listDialers, srvr)
+	}
+	//fmt.Println("Status of GetServers ", reply.Status, ", and the list of servers is ", reply.Servers)
+
+	newlibstore.listServers = reply.Servers
 
 	return a, nil
 }
 
+func getServer(ls *libstore, key string) *rpc.Client {
+	hash := StoreHash(key)
+
+	i := 0
+	for _, node := range ls.listServers {
+		if hash <= node.NodeID {
+			return ls.listDialers[i]
+		}
+		i = i + 1
+	}
+	return ls.listDialers[0]
+}
+
 func (ls *libstore) Get(key string) (string, error) {
-	fmt.Println("Get invoked with key ", key)
+	//fmt.Println("Get invoked with key ", key)
 
 	args := storagerpc.GetArgs{}
 
@@ -103,7 +129,7 @@ func (ls *libstore) Get(key string) (string, error) {
 
 	var reply storagerpc.GetReply
 
-	err := ls.storageserver.Call("StorageServer.Get", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.Get", &args, &reply)
 	if reply.Status != storagerpc.OK {
 		return "", errors.New("RPC GET Didn't return OK")
 	}
@@ -112,36 +138,36 @@ func (ls *libstore) Get(key string) (string, error) {
 		return "", errors.New("RPC GET Failed")
 	}
 
-	fmt.Println("Returning ", reply.Value)
+	//fmt.Println("Returning ", reply.Value)
 	return reply.Value, nil
 }
 
 func (ls *libstore) Put(key, value string) error {
-	fmt.Println("PUT Invoked")
+	//fmt.Println("PUT Invoked")
 	args := storagerpc.PutArgs{Key: key, Value: value}
 	var reply storagerpc.PutReply
 
-	err := ls.storageserver.Call("StorageServer.Put", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.Put", &args, &reply)
 	if err != nil {
 		fmt.Println("RPC Get Failed")
 		return errors.New("RPC Get Failed")
 	}
 	if reply.Status != storagerpc.OK {
-		fmt.Println("RPC Put Didn't return OK")
-		return errors.New("RPC Put Didn't return OK")
+		fmt.Println("RPC Put Didn't return OK. It returned ", reply.Status)
+		return errors.New(fmt.Sprintf("RPC Put Didn't return OK. It returned %d", reply.Status))
 	}
 
 	return nil
 }
 
 func (ls *libstore) Delete(key string) error {
-	fmt.Println("DELETE Invoked")
+	//fmt.Println("DELETE Invoked")
 
 	args := storagerpc.DeleteArgs{key}
 
 	var reply storagerpc.DeleteReply
 
-	err := ls.storageserver.Call("StorageServer.Delete", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.Delete", &args, &reply)
 
 	if err != nil {
 		fmt.Println("RPC Delete Failed")
@@ -157,7 +183,7 @@ func (ls *libstore) Delete(key string) error {
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
-	fmt.Println("GETLIST Invoked")
+	//fmt.Println("GETLIST Invoked")
 
 	args := storagerpc.GetArgs{}
 
@@ -167,29 +193,35 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 
 	var reply storagerpc.GetListReply
 
-	err := ls.storageserver.Call("StorageServer.GetList", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.GetList", &args, &reply)
 
 	if err != nil {
 		fmt.Println("RPC GetList Failed")
 		return nil, errors.New("RPC GetList Failed")
 	}
 
+	// TODO: Now, intelligently return error messages such that the tribserver knows what exactly
+	// happened. For example, if it returns KeyNotFound, return blank list
+	if reply.Status == storagerpc.KeyNotFound {
+		var list []string
+		return list, nil
+	}
 	if reply.Status != storagerpc.OK {
 		fmt.Println("RPC GetList Didn't return OK")
-		return nil, errors.New("RPC GetList Didn't return OK")
+		return nil, errors.New(fmt.Sprintf("RPC GetList Didn't return OK. It returned %d", reply.Status))
 	}
 
 	return reply.Value, nil
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
-	fmt.Println("REMOVEFROMLIST Invoked")
+	//fmt.Println("REMOVEFROMLIST Invoked")
 	//fmt.Println("Key is ", key, " and value is ", removeItem)
 
 	args := storagerpc.PutArgs{key, removeItem}
 	var reply storagerpc.PutReply
 
-	err := ls.storageserver.Call("StorageServer.RemoveFromList", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.RemoveFromList", &args, &reply)
 
 	if err != nil {
 		fmt.Println("RPC RemoveFromList Failed")
@@ -197,7 +229,7 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	}
 
 	if reply.Status != storagerpc.OK {
-		fmt.Println("RPC RemoveFromList Didn't return OK")
+		//fmt.Println("RPC RemoveFromList Didn't return OK")
 		return errors.New("RPC RemoveFromList Didn't return OK")
 	}
 
@@ -205,13 +237,13 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 }
 
 func (ls *libstore) AppendToList(key, newItem string) error {
-	fmt.Println("APPENDTOLIST Invoked")
+	//fmt.Println("APPENDTOLIST Invoked")
 	//fmt.Println("Key is ", key, " and value is ", newItem)
 
 	args := storagerpc.PutArgs{key, newItem}
 	var reply storagerpc.PutReply
 
-	err := ls.storageserver.Call("StorageServer.AppendToList", &args, &reply)
+	err := getServer(ls, args.Key).Call("StorageServer.AppendToList", &args, &reply)
 
 	if err != nil {
 		fmt.Println("RPC AppendToList Failed")
@@ -219,7 +251,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	}
 
 	if reply.Status != storagerpc.OK {
-		fmt.Println("RPC ApppendToList Didn't return OK")
+		//fmt.Println("RPC ApppendToList Didn't return OK")
 		return errors.New("RPC AppendToList Didn't return OK")
 	}
 
@@ -229,6 +261,20 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
 	fmt.Println("REVOKELEASE Invoked")
 	return errors.New("not implemented")
+}
+
+type ServerSlice []storagerpc.Node
+
+func (slice ServerSlice) Len() int {
+	return len(slice)
+}
+
+func (slice ServerSlice) Less(i, j int) bool {
+	return slice[i].NodeID < slice[j].NodeID
+}
+
+func (slice ServerSlice) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
 }
 
 /*package storagerpc

@@ -84,14 +84,14 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	a = &server
 
 	if len(masterServerHostPort) == 0 {
-		fmt.Println("This is the master speaking, with numNode = ", numNodes)
+		fmt.Println("This is the master speaking, with numNode = ", numNodes, " and port = ", port)
 		/* Now register for RPCs */
 		server.ackedSlaves = 1
 		self := storagerpc.Node{fmt.Sprintf("localhost:%d", port), nodeID}
 
 		server.serverList = append(server.serverList, self)
 
-		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
 		if err != nil {
 			return nil, err
 		}
@@ -195,20 +195,12 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 	}
 
-	/* For master: Now wait until all other servers have joined the ring */
-
-	/* For CP, since no slaves are gonna join, return directly */
-
-	//fmt.Println("After sleeping, server.ackedSlaves = ", server.ackedSlaves, " and numNodes is ", server.numNodes)
 	return a, nil
 }
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
 	defer fmt.Println("Leaving RegisterServer")
 	fmt.Println("RegisterServer invoked! By: ", args.ServerInfo.HostPort)
-	/*fmt.Println("numNodes inside RegisterServer is ", ss.numNodes)
-	fmt.Println("After adding slave to list of servers, ackedSlaves is ", ss.ackedSlaves)
-	fmt.Println("HostPort of this slave server is ", args.ServerInfo.HostPort, " and the nodeID is ", args.ServerInfo.NodeID)*/
 
 	if _, ok := ss.ackedSlavesMap[args.ServerInfo]; ok {
 		if ss.ackedSlaves == ss.numNodes {
@@ -254,27 +246,29 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
-	defer fmt.Println("Leaving Get")
-	fmt.Println("Get invoked!")
-	fmt.Println("Key is ", args.Key)
-	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)
+	/*defer fmt.Println("Leaving Get")
+	fmt.Println("Get invoked!")*/
+	/*fmt.Println("Key is ", args.Key)
+	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
 		if !(hash > ss.minhash || hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
 			fmt.Println("Returning because hash doesn't match")
+			fmt.Println("Server list is ", ss.serverList)
 			return nil
 		}
 	} else {
 		if !(hash > ss.minhash && hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
 			fmt.Println("Returning because hash doesn't match")
+			fmt.Println("Server list is ", ss.serverList)
 			return nil
 		}
 	}
 
-	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
+	//fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
 	val, ok := ss.tribbleMap[args.Key]
 
@@ -309,8 +303,8 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 }
 
 func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
-	defer fmt.Println("Leaving GetList")
-	fmt.Println("GetList invoked!")
+	/*defer fmt.Println("Leaving GetList")
+	fmt.Println("GetList invoked!")*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
@@ -324,7 +318,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 			return nil
 		}
 	}
-	fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
+	//fmt.Println("Key is ", args.Key, ", WantLease is ", args.WantLease, " and HostPort is ", args.HostPort)
 
 	val, ok := ss.listMap[args.Key]
 
@@ -388,8 +382,8 @@ func revoke(ss *storageServer, key string, libstore *rpc.Client, hostport string
 }
 
 func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.DeleteReply) error {
-	defer fmt.Println("Leaving Delete")
-	fmt.Println("Delete invoked!")
+	/*defer fmt.Println("Leaving Delete")
+	fmt.Println("Delete invoked!")*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
@@ -403,7 +397,7 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 			return nil
 		}
 	}
-	fmt.Println("Key is ", args.Key)
+	//fmt.Println("Key is ", args.Key)
 
 	ss.putLock.Lock() // lock map of locks
 	_, ok := ss.putLocksMap[args.Key]
@@ -467,22 +461,24 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	defer fmt.Println("Leaving Put")
+	/*defer fmt.Println("Leaving Put")
 	fmt.Println("Put invoked!")
 	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
-	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)
+	fmt.Println("The hash is ", StoreHash(args.Key), ", my nodeID is ", ss.nodeID, " and my port is ", ss.port)*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
 		if !(hash > ss.minhash || hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
 			fmt.Println("Returning because hashes don't match")
+			fmt.Println("Server list is ", ss.serverList)
 			return nil
 		}
 	} else {
 		if !(hash > ss.minhash && hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
 			fmt.Println("Returning because hashes don't match")
+			fmt.Println("Server list is ", ss.serverList)
 			return nil
 		}
 	}
@@ -497,7 +493,7 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	}
 	ss.putLock.Unlock()
 
-	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
+	//fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 	/* TODO: If key exists, revoke leases! */
 
 	//Key exists in lease map!
@@ -544,22 +540,24 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 }
 
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	defer fmt.Println("Leaving AppendToList")
-	fmt.Println("AppendToList invoked!")
+	/*defer fmt.Println("Leaving AppendToList")
+	fmt.Println("AppendToList invoked!")*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
 		if !(hash > ss.minhash || hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
+			fmt.Println("AppendToList returning WrongServer")
 			return nil
 		}
 	} else {
 		if !(hash > ss.minhash && hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
+			fmt.Println("AppendToList returning WrongServer")
 			return nil
 		}
 	}
-	fmt.Println("Key is ", args.Key, " and Value is ", args.Value)
+	//fmt.Println("Key is ", args.Key, " and Value is ", args.Value)
 
 	ss.appendLock.Lock() // lock map of locks
 	_, ok := ss.appendLocksMap[args.Key]
@@ -583,6 +581,7 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 			if val == args.Value {
 				reply.Status = storagerpc.ItemExists
 				ss.appendLocksMap[args.Key].Unlock()
+				//fmt.Println("AppendToList returning ItemExists")
 				return nil
 			}
 		}
@@ -632,22 +631,24 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	defer fmt.Println("Leaving RemoveFromList")
-	fmt.Println("RemoveFromList invoked!")
+	/*defer fmt.Println("Leaving RemoveFromList")
+	fmt.Println("RemoveFromList invoked!")*/
 
 	hash := StoreHash(args.Key)
 	if ss.first == 1 {
 		if !(hash > ss.minhash || hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
+			fmt.Println("RemoveFromList returning WrongServer")
 			return nil
 		}
 	} else {
 		if !(hash > ss.minhash && hash <= ss.maxhash) {
 			reply.Status = storagerpc.WrongServer
+			fmt.Println("RemoveFromList returning WrongServer")
 			return nil
 		}
 	}
-	fmt.Println("Key is ", args.Key, " and value is ", args.Value)
+	//fmt.Println("Key is ", args.Key, " and value is ", args.Value)
 
 	ss.appendLock.Lock() // lock map of locks
 	_, ok := ss.appendLocksMap[args.Key]
@@ -706,6 +707,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 		i = i + 1
 	}
 	reply.Status = storagerpc.ItemNotFound
+	//fmt.Println("RemoveFromList returning ItemNotFound")
 	ss.appendLocksMap[args.Key].Unlock()
 	return nil
 }

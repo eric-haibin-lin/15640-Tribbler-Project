@@ -125,6 +125,9 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 	}
 	userSubKey := util.FormatSubListKey(userID)
 	list, err := ts.lib.GetList(userSubKey)
+	// TODO: Check what this error message is, and accordingly return stuff
+	// for example, if err == "KeyNotFound", return blank list.
+	// OR, as an alternative to the above approach, we could return nil error but with a blank list
 	if err != nil {
 		return err
 	}
@@ -229,7 +232,7 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 			break
 		}
 	}
-	fmt.Println("GetTribbles returning", len(tribbles), "results")
+	//fmt.Println("GetTribbles returning", len(tribbles), "results")
 	reply.Tribbles = tribbles
 	reply.Status = tribrpc.OK
 	return nil
@@ -275,7 +278,7 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	if length > 100 {
 		length = 100
 	}
-	fmt.Println("GetTribblesBySubscription returning", length, "results")
+	//fmt.Println("GetTribblesBySubscription returning", length, "results")
 	reply.Status = tribrpc.OK
 	reply.Tribbles = tribbles[:length]
 	return nil
