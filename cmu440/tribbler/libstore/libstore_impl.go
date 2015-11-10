@@ -10,6 +10,7 @@ import (
 	//"net/http"
 	"net/rpc"
 	"sort"
+	"sync"
 )
 
 type libstore struct {
@@ -18,6 +19,11 @@ type libstore struct {
 	mode                 LeaseMode
 	listServers          []storagerpc.Node
 	listDialers          []*rpc.Client
+	countMtx 			 *sync.Mutex
+	valueMtx 			 *sync.Mutex
+	listMtx	 			 *sync.Mutex
+	countMap			 map[string]int
+	valueMap        	 map[string]CacheLease
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -52,11 +58,16 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	var b LeaseCallbacks
 
 	newlibstore := libstore{}
-
+	
 	newlibstore.masterServerHostPort = masterServerHostPort
 	newlibstore.myHostPort = myHostPort
 	newlibstore.mode = mode
-
+	newlibstore.countMtx = &sync.Mutex{}
+	newlibstore.valueMtx = &sync.Mutex{}
+	newlibstore.listMtx = &sync.Mutex{}
+	newlibstore.countMap = make(map[string]int)
+	newlibstore.valueMap = make(map[string]CacheLease)
+	
 	a = &newlibstore
 	b = &newlibstore
 
@@ -99,9 +110,10 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		newlibstore.listDialers = append(newlibstore.listDialers, srvr)
 	}
 	//fmt.Println("Status of GetServers ", reply.Status, ", and the list of servers is ", reply.Servers)
-
+	
 	newlibstore.listServers = reply.Servers
-
+	go newlibstore.CountChecker()
+	go newlibstore.LeaseChecker()
 	return a, nil
 }
 
@@ -120,15 +132,23 @@ func getServer(ls *libstore, key string) *rpc.Client {
 
 func (ls *libstore) Get(key string) (string, error) {
 	//fmt.Println("Get invoked with key ", key)
-
+	val, ok := ls.GetCacheValue(key)
+	if ok {
+		return val.Value.(string), nil
+	} 
+	
 	args := storagerpc.GetArgs{}
-
 	args.Key = key
-	args.WantLease = false
 	args.HostPort = ls.myHostPort
+	if ls.mode == Always {
+		args.WantLease = true	
+	} else if ls.mode == Never {
+		args.WantLease = false
+	} else {
+		args.WantLease = ls.IncreCount(key)
+	}
 
 	var reply storagerpc.GetReply
-
 	err := getServer(ls, args.Key).Call("StorageServer.Get", &args, &reply)
 	if reply.Status != storagerpc.OK {
 		return "", errors.New("RPC GET Didn't return OK")
@@ -137,9 +157,12 @@ func (ls *libstore) Get(key string) (string, error) {
 		fmt.Println("RPC GET Failed")
 		return "", errors.New("RPC GET Failed")
 	}
-
+	if reply.Lease.Granted {
+		lease := CacheLease{ Time: time.Now(), Value: reply.Value, ValidSeconds: reply.Lease.ValidSeconds}
+		ls.PutCacheValue(key, lease)
+	}
 	//fmt.Println("Returning ", reply.Value)
-	return reply.Value, nil
+	return reply.Value, nil		
 }
 
 func (ls *libstore) Put(key, value string) error {
@@ -156,7 +179,6 @@ func (ls *libstore) Put(key, value string) error {
 		fmt.Println("RPC Put Didn't return OK. It returned ", reply.Status)
 		return errors.New(fmt.Sprintf("RPC Put Didn't return OK. It returned %d", reply.Status))
 	}
-
 	return nil
 }
 
@@ -184,15 +206,23 @@ func (ls *libstore) Delete(key string) error {
 
 func (ls *libstore) GetList(key string) ([]string, error) {
 	//fmt.Println("GETLIST Invoked")
+	val, ok := ls.GetCacheValue(key)
+	if ok {
+		return val.Value.([]string), nil
+	} 
 
 	args := storagerpc.GetArgs{}
-
 	args.Key = key
-	args.WantLease = false
 	args.HostPort = ls.myHostPort
-
+	if ls.mode == Always {
+		args.WantLease = true	
+	} else if ls.mode == Never {
+		args.WantLease = false
+	} else {
+		args.WantLease = ls.IncreCount(key)
+	}
+	
 	var reply storagerpc.GetListReply
-
 	err := getServer(ls, args.Key).Call("StorageServer.GetList", &args, &reply)
 
 	if err != nil {
@@ -204,13 +234,16 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	// happened. For example, if it returns KeyNotFound, return blank list
 	if reply.Status == storagerpc.KeyNotFound {
 		var list []string
-		return list, nil
+		return list, errors.New("RPC GetList returns storagerpc.KeyNotFound")
 	}
 	if reply.Status != storagerpc.OK {
 		fmt.Println("RPC GetList Didn't return OK")
 		return nil, errors.New(fmt.Sprintf("RPC GetList Didn't return OK. It returned %d", reply.Status))
 	}
-
+	if reply.Lease.Granted {
+		lease := CacheLease{ Time: time.Now(), Value: reply.Value, ValidSeconds: reply.Lease.ValidSeconds}
+		ls.PutCacheValue(key, lease)
+	}
 	return reply.Value, nil
 }
 
@@ -254,13 +287,22 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 		//fmt.Println("RPC ApppendToList Didn't return OK")
 		return errors.New("RPC AppendToList Didn't return OK")
 	}
-
+	
 	return nil
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
 	fmt.Println("REVOKELEASE Invoked")
-	return errors.New("not implemented")
+	key := args.Key 
+	ls.ClearCacheValue(key)
+	reply.Status = storagerpc.OK
+	return nil
+}
+
+type CacheLease struct {
+	Value interface{}
+	Time time.Time
+	ValidSeconds int
 }
 
 type ServerSlice []storagerpc.Node
@@ -275,6 +317,77 @@ func (slice ServerSlice) Less(i, j int) bool {
 
 func (slice ServerSlice) Swap(i, j int) {
 	slice[i], slice[j] = slice[j], slice[i]
+}
+
+func (ls *libstore) LeaseChecker() {
+	for {
+		time.Sleep(time.Second * storagerpc.LeaseSeconds)
+		ls.valueMtx.Lock()
+		for key, lease := range ls.valueMap{
+			if int(time.Since(lease.Time).Seconds()) > lease.ValidSeconds {
+				delete(ls.valueMap, key)
+			}
+		}
+		ls.valueMtx.Unlock()
+	}
+}
+
+
+func (ls *libstore) CountChecker() {
+	for {
+		time.Sleep(time.Second * storagerpc.QueryCacheSeconds)
+		ls.countMtx.Lock()
+		ls.countMap = make(map[string]int)
+		ls.countMtx.Unlock()
+	}
+}
+
+func (ls *libstore) GetCacheValue(key string) (CacheLease, bool) {
+	ls.valueMtx.Lock()
+	defer ls.valueMtx.Unlock()
+	
+	lease, ok := ls.valueMap[key]
+	if !ok {
+		return CacheLease{}, false
+	}
+	//just lazily check if any lease is out of date
+	duration := int(time.Since(lease.Time).Seconds())
+	fmt.Println(duration, "seconds has passed for key", key)
+	if duration >= lease.ValidSeconds{
+		fmt.Println("revoking", key, "since it has passed", storagerpc.LeaseSeconds, "seconds")
+		delete(ls.valueMap, key)
+		return CacheLease{}, false	
+	} else {
+		fmt.Println("key", key, "not expired yet.")
+		return lease, true
+	}
+}
+
+func (ls *libstore) PutCacheValue(key string, value CacheLease) {
+	ls.valueMtx.Lock()
+	defer ls.valueMtx.Unlock()
+	ls.valueMap[key] = value
+}
+
+func (ls *libstore) IncreCount(key string) bool {
+	ls.countMtx.Lock()
+	defer ls.countMtx.Unlock()
+	count := ls.countMap[key]
+	count += 1
+	if count >= storagerpc.QueryCacheThresh {
+		return true
+	}
+	ls.countMap[key] = count
+	return false
+}
+
+func (ls *libstore) ClearCacheValue(key string) {
+	ls.countMtx.Lock()
+	defer ls.countMtx.Unlock()
+	ls.valueMtx.Lock()
+	defer ls.valueMtx.Unlock()
+	ls.countMap[key] = 0	
+	delete(ls.valueMap, key)
 }
 
 /*package storagerpc

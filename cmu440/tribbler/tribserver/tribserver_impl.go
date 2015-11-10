@@ -25,7 +25,7 @@ type tribServer struct {
 //
 // For hints on how to properly setup RPC, see the rpc/tribrpc package.
 func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) {
-	lib, err := libstore.NewLibstore(masterServerHostPort, myHostPort, libstore.Never)
+	lib, err := libstore.NewLibstore(masterServerHostPort, myHostPort, libstore.Normal)
 	tribServer := &tribServer{lib: lib}
 	// Get the port number
 	_, port, err := net.SplitHostPort(myHostPort)
