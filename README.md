@@ -1,7 +1,9 @@
 # 15640-Tribbler-Project
 Tribbler in Golang
 
-p2
+<img src="archi.png" width="540px" height="300px" />
+
+p2 (tribbler)
 ==
 
 This repository contains the starter code for project 2 (15-440, Fall 2015).
